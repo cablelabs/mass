@@ -1,0 +1,18 @@
+#! /bin/bash
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+MASS_ROOT=${SCRIPT_DIR}/../
+cd ${MASS_ROOT}
+./bin/gengan.sh > /dev/null 2>&1
+GAN=`FULL=no Rscript graph/score.R 100 data 100 gan 2 2>/dev/null | grep "RESULT" | awk '{print $2" "$4" "$7}'`
+UNI=`FULL=no Rscript graph/score.R 100 data 100 uni 2 2>/dev/null | grep "RESULT" | awk '{print $2" "$4" "$7}'` 
+#GAN_KLD=`echo "$GAN" | awk '{print $1}'`
+GAN_MOM=`echo "$GAN" | awk '{print $2}'`
+GAN_COR=`echo "$GAN" | awk '{print $3}'`
+#UNI_KLD=`echo "$UNI" | awk '{print $1}'`
+UNI_MOM=`echo "$UNI" | awk '{print $2}'`
+UNI_COR=`echo "$UNI" | awk '{print $3}'`
+#KLD=`echo "scale=4;(${UNI_KLD} - ${GAN_KLD})/${UNI_KLD}" | bc`
+MOM=`echo "scale=4;(${UNI_MOM} - ${GAN_MOM})/${UNI_MOM}" | bc`
+COR=`echo "scale=4;(${UNI_COR} - ${GAN_COR})/${UNI_COR}" | bc`
+KLD=0
+echo -n "$KLD $MOM $COR"

@@ -1,0 +1,197 @@
+#! /bin/bash
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+
+CONFIG=${1:-""}
+if [ "X${CONFIG}" != "X" ]; then
+  source ${CONFIG}
+fi
+
+if test -f ${DIR}/default.config; then
+  source ${DIR}/default.config
+else
+  echo "default.config missing"
+  exit 1
+fi
+
+if [ ${LOG_ENABLED} -eq 1 ]; then
+  mkdir -p ${LOG_DIR}
+fi
+
+PERFCLIENT=${DIR}/${PERF_CLIENT}client.sh
+
+if ! test -f ${PERFCLIENT}; then
+  echo "${PERFCLIENT} missing"
+  exit 1
+fi
+
+IPERF_MISSING=0
+if [ "${PERF_CLIENT}" == "iperf" ]; then
+   which iperf3 >/dev/null || IPERF_MISSING=1
+fi
+
+if [ ${IPERF_MISSING} -eq 1 ]; then
+  echo "iperf3 missing"
+  exit 1
+fi
+
+CURL_NEEDED=0
+stream_file=${CACHE_DIR}/STREAM.trace
+if [ ! -f "${stream_file}" ] ||  [ ${USE_CACHED_TRACES} -eq 0 ]; then
+  CURL_NEEDED=1
+fi
+
+if [ ${CURL_NEEDED} -eq 1 ]; then
+  CURL_MISSING=0
+  which curl >/dev/null || CURL_MISSING=1
+  if [ ${CURL_MISSING} -eq 1 ]; then
+    echo "curl missing"
+    exit 1
+  fi
+fi
+
+get_signal_context() {
+  SIGNAL=`${DIR}/wifisignal.sh`
+  if [ ${SIGNAL} -lt -75 ]; then
+    echo "LOW"
+  else
+    echo "HIGH"
+  fi
+}
+
+get_proto() {
+  rnum=$((RANDOM%10000+1))
+  R=`echo "scale=4; $rnum/10000" | bc`
+  ISLESS=`echo "$R < ${UDP_PROB}" | bc`
+  if [ $ISLESS -eq 1 ]; then
+    echo -n "udp"
+  else
+    echo -n "tcp"
+  fi
+}
+
+get_trace() {
+  context=$1
+  context_file=${CACHE_DIR}/${context}.trace
+  if [ ! -f "${context_file}" ] ||  [ ${USE_CACHED_TRACES} -eq 0 ]; then
+    curl -s -d '{"context":"'${CONTEXT}'","seq_len":'${SEQ_LEN}'}' http://${MASS_HOST}:7777/generate?format=txt > ${context_file}
+  fi
+  cat ${context_file}
+}
+next_context () {
+  current=$1
+  rnum=$((RANDOM%10000+1))
+  R=`echo "scale=4; $rnum/10000" | bc`
+  if [ $current == "INTERACT" ]; then
+    STAY_PROB=${INTERACT_STAY_PROB}
+  else
+    STAY_PROB=${STREAM_STAY_PROB}
+  fi
+  ISLESS=`echo "$R < ${STAY_PROB}" | bc`
+  if [ $ISLESS -eq 1 ]; then
+    echo $current
+  else
+     if [ $current == "INTERACT" ]; then
+       echo "STREAM"
+     else
+       echo "INTERACT"
+     fi
+  fi
+}
+
+mkdir -p ${CACHE_DIR}
+
+while [ 1 ]; do
+DATA_STREAM=$(get_trace "STREAM")
+DATA_STREAM_HIGH=$(get_trace "STREAM_HIGH")
+DATA_STREAM_LOW=$(get_trace "STREAM_LOW")
+DATA_INTERACT=$(get_trace "INTERACT")
+DATA_INTERACT_LOW=$(get_trace "INTERACT_LOW")
+DATA_INTERACT_HIGH=$(get_trace "INTERACT_HIGH")
+
+CURRENT_APP_CONTEXT="${INITIAL_CONTEXT}"
+for i in `seq 1 ${SEQ_LEN}`; do
+  CURRENT_APP_CONTEXT=$(next_context ${CURRENT_APP_CONTEXT})
+  if [ ${USE_SIGNAL} -eq 0 ]; then
+    if [ "${CURRENT_APP_CONTEXT}" == "INTERACT" ]; then
+      DATA="${DATA_INTERACT}"
+    else
+      DATA="${DATA_STREAM}"
+    fi
+  else
+    CURRENT_SIGNAL_CONTEXT=$(get_signal_context)
+    if [ "${CURRENT_APP_CONTEXT}" == "INTERACT" ]; then
+      if [ "${CURRENT_SIGNAL_CONTEXT}" == "HIGH" ]; then
+        DATA="${DATA_INTERACT_HIGH}"
+      else
+        DATA="${DATA_INTERACT_LOW}"
+      fi
+    else
+      if [ "${CURRENT_SIGNAL_CONTEXT}" == "HIGH" ]; then
+        DATA="${DATA_STREAM_HIGH}"
+      else
+        DATA="${DATA_STREAM_LOW}"
+      fi
+    fi
+  fi
+  PROTO=$(get_proto)
+  echo "Current Context ${CURRENT_APP_CONTEXT} ${CURRENT_SIGNAL_CONTEXT} ${PROTO}"
+  LINE=`echo -e "${DATA}" | sed -n $i','$i'p'`
+  echo "$LINE"
+  DOWN=`echo -e "${LINE}" | awk '{print $1}'`
+  DOWN=$(printf "%.14f" $DOWN)
+  UP=`echo -e "${LINE}" | awk '{print $2}'`
+  UP=$(printf "%.14f" $UP)
+  DOWN_BPS=`echo -e "scale=0;(${DOWN}*1000000*${MAX_DOWN})/1.0" | bc`
+  UP_BPS=`echo -e "scale=0;(${UP}*1000000*${MAX_UP})/1.0" | bc`
+  echo "Got DOWN ${DOWN_BPS} UP ${UP_BPS}"
+  DOWAIT=0
+  IPROTO=""
+  DOWN_PORT_IPERF=${DOWN_PORT}
+  UP_PORT_IPERF=${UP_PORT}
+  if [ ${PROTO} == "udp" ]; then
+    IPROTO="-u"
+    DOWN_PORT_IPERF=$(expr ${DOWN_PORT} + 1)
+    UP_PORT_IPERF=$(expr ${UP_PORT} + 1)
+  fi
+  # ensure up and down series are kept in sync
+  if [ ${DOWN_BPS} -lt ${BUFFER} ]; then
+    DOWN_BPS=${BUFFER}
+  fi
+  if [ ${UP_BPS} -lt ${BUFFER} ]; then
+    UP_BPS=${BUFFER}
+  fi
+  if [ ${DISABLE_DOWNLOADS} -eq 1 ]; then
+    DOWN_BPS=0
+  fi
+  if [ ${DISABLE_UPLOADS} -eq 1 ]; then
+    UP_BPS=0
+  fi
+  if [ ${DOWN_BPS} -gt 0 ]; then
+    if [ ${LOG_ENABLED} -eq 1 ]; then
+      LOG_FILE=${LOG_DIR}/mass.${PROTO}down
+    else
+      LOG_FILE="/dev/null"
+    fi
+    PERF_HOST=${PERF_HOST} PORT=${DOWN_PORT} DIRECTION=DOWN EPOCH_TIME=${EPOCH_TIME} BPS=${DOWN_BPS} PROTO=${PROTO} BUFFER=${BUFFER}\
+         ${PERFCLIENT}  | tee -a ${LOG_FILE} &
+    DOWAIT=1
+  fi
+  if [ ${UP_BPS} -gt 0 ]; then 
+    if [ ${LOG_ENABLED} -eq 1 ]; then
+      LOG_FILE=${LOG_DIR}/mass.${PROTO}up
+    else
+      LOG_FILE="/dev/null"
+    fi
+    PERF_HOST=${PERF_HOST} PORT=${UP_PORT} DIRECTION=UP EPOCH_TIME=${EPOCH_TIME} BPS=${UP_BPS} PROTO=${PROTO} BUFFER=${BUFFER}\
+         ${PERFCLIENT} | tee -a ${LOG_FILE}  &
+    DOWAIT=1
+  fi
+  if [ ${DOWAIT} -eq 1 ]; then
+    wait
+  fi
+done
+if [ ${CONTINUOUS} -eq 0 ]; then
+  break
+fi
+done
+
