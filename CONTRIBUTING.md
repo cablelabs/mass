@@ -47,5 +47,5 @@ Some useful resources to get started:
 - Project [README][9]
 - [MASS license][10]
 
-[10]: README.md
-[11]: LICENSE
+[9]: README.md
+[10]: LICENSE
